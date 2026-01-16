@@ -5085,6 +5085,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     await safeAsync(loadAllSelects);
     await safeAsync(loadUsersAndInitDriSelects);
+    await safeAsync(initTaskDetailModalBindings);
     await safeAsync(initCommentMentionAutocomplete);
     await safeAsync(loadProjectList);
     await safeAsync(initDeadlinePicker);

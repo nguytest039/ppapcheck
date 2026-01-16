@@ -921,15 +921,6 @@ async function showDashboardTasks(filterType) {
     }
 }
 
-function showTaskDetail(taskId) {
-    // closeTaskListModal();
-    // TODO: Fetch task detail t? API
-    // GET /api/tasks/{taskId}
-
-    var modal = new bootstrap.Modal(document.getElementById('taskDetailModal'));
-    modal.show();
-}
-
 
 
 async function deleteTask(taskId) {
@@ -2032,66 +2023,6 @@ function initCommentMentionAutocomplete() {
     }
 }
 
-let currentTaskDetailObj = null;
-let CURRENT_USER_IDCARD = null;
-let CURRENT_USER_IDCARD_LOADED = false;
-
-async function fetchCurrentUserIdCard() {
-    if (CURRENT_USER_IDCARD_LOADED) return CURRENT_USER_IDCARD;
-    CURRENT_USER_IDCARD_LOADED = true;
-    try {
-        const res = await fetch('/ppap-system/api/users/get-profile');
-        if (!res.ok) return null;
-        const json = await res.json();
-        const profile = json && (json.data || json.result) ? json.data || json.result : null;
-        const idCard =
-            profile && profile.idCard !== undefined && profile.idCard !== null ? String(profile.idCard).trim() : '';
-        CURRENT_USER_IDCARD = idCard || null;
-        return CURRENT_USER_IDCARD;
-    } catch (e) {
-        return null;
-    }
-}
-
-function setTaskDetailSignPermission(modalRoot, canSign) {
-    if (!modalRoot) return;
-    modalRoot.dataset.canSign = canSign ? '1' : '0';
-}
-
-async function fetchSignFlowItems(taskId) {
-    if (!taskId) return [];
-    const res = await fetch(`/ppap-system/api/tasks/${encodeURIComponent(taskId)}/sign-flow`);
-    if (!res.ok) return [];
-    const json = await res.json();
-    return Array.isArray(json?.data) ? json.data : [];
-}
-
-
-
-
-
-function isInProgressStatus(statusVal) {
-    if (statusVal === null || statusVal === undefined) return false;
-    const s = String(statusVal).trim().toLowerCase();
-    if (!s) return false;
-    return s === 'in_progress' || s === 'in-progress' || s.includes('progress');
-}
-
-function isWaitingForApprovalStatus(statusVal) {
-    if (statusVal === null || statusVal === undefined) return false;
-    const s = String(statusVal).trim().toLowerCase();
-    if (!s) return false;
-    if (s === 'waiting_for_approval' || s === 'waiting-for-approval') return true;
-    if (s === 'waiting') return true;
-    // covers "waiting for approval" label coming from DB
-    return s.includes('waiting') && s.includes('approval');
-}
-
-function isCompletedStatus(statusVal) {
-    if (statusVal === null || statusVal === undefined) return false;
-    const normalized = String(statusVal).trim().toUpperCase().replace(/\s+/g, '_').replace(/-/g, '_');
-    return normalized === 'COMPLETED';
-}
 
 
 
@@ -2100,29 +2031,6 @@ function isCompletedStatus(statusVal) {
 
 
 
-
-
-
-
-
-
-
-function parseTaskUpdates(content) {
-    const fieldMatches = content.matchAll(/\[(\w+):/g);
-    const fields = Array.from(fieldMatches).map((m) => m[1]);
-
-    const fieldLabels = {
-        dri: 'DRI',
-        dueDate: 'Deadline',
-        status: 'Status',
-        priority: 'Priority',
-        stageId: 'Stage',
-        processId: 'Process',
-    };
-
-    const translatedFields = fields.map((f) => fieldLabels[f] || f);
-    return translatedFields.join(', ') || 'Task updated';
-}
 
 
 
