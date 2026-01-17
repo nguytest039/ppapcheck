@@ -1,322 +1,18 @@
-import { TaskDetailModal, openTaskDetail, initTaskDetailModalBindings } from './task_detail_modal.js';
+import { TaskDetailModal, openTaskDetail, initTaskDetailModalBindings } from '../task_detail_modal.js';
+import { clearQueryParam, getQueryParam, setQueryParam } from '../shared/url_sync.js';
+import {
+    formatUserLabel,
+    normalizeStatus,
+    getPriorityBadgeClass,
+    getPriorityLabel,
+} from '../shared/helper.js';
+import { DateFormatter, debounce, extractApiMessage, getApiErrorMessage } from '../shared/utils.js';
+import * as api from './api.js';
+import * as ui from './ui.js';
 
-const PROJECT_TASK_TABLE_LABELS = window.PROJECT_TASK_TABLE_I18N
-const DateFormatter = {
-    toAPIFormat(dateStr) {
-        if (!dateStr || dateStr === '-' || String(dateStr).toUpperCase() === 'N/A') {
-            return null;
-        }
-
-        const str = String(dateStr).trim().replace('T', ' ');
-
-        if (window.moment) {
-            const m = window.moment(
-                str,
-                [
-                    'YYYY/MM/DD',
-                    'YYYY-MM-DD',
-                    'YYYY/MM/DD HH:mm',
-                    'YYYY-MM-DD HH:mm',
-                    'YYYY/MM/DD HH:mm:ss',
-                    'YYYY-MM-DD HH:mm:ss',
-                ],
-                true
-            );
-
-            if (m && typeof m.isValid === 'function' && m.isValid()) {
-                return m.format('YYYY/MM/DD HH:mm:ss');
-            }
-        }
-
-        const parts = str.split(' ');
-        let datePart = parts[0] || '';
-        let timePart = parts[1] || '00:00:00';
-
-        datePart = datePart.substring(0, 10).replace(/-/g, '/');
-
-        const tPieces = timePart.split(':');
-        if (tPieces.length === 1) {
-            timePart = `${tPieces[0] || '00'}:00:00`;
-        } else if (tPieces.length === 2) {
-            timePart = `${tPieces[0] || '00'}:${tPieces[1] || '00'}:00`;
-        } else {
-            timePart = `${tPieces[0] || '00'}:${tPieces[1] || '00'}:${tPieces[2] || '00'}`;
-        }
-
-        return `${datePart} ${timePart}`;
-    },
-
-    toDisplayFormat(dateStr) {
-        return this.toAPIFormat(dateStr) || '-';
-    },
-};
-
-function formatDateForFilterInput(value) {
-    if (!value) return '';
-    if (typeof value.format === 'function') return value.format('YYYY/MM/DD');
-    if (value instanceof Date) {
-        const year = value.getFullYear();
-        const month = ('0' + (value.getMonth() + 1)).slice(-2);
-        const day = ('0' + value.getDate()).slice(-2);
-        return `${year}/${month}/${day}`;
-    }
-    const str = String(value).trim();
-    const normalized = str.split(' ')[0].replace(/-/g, '/');
-    return normalized;
-}
-
-function escapeHtml(input) {
-    if (input === null || input === undefined) return '';
-    return String(input)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-}
-
-function highlightMentions(safeText) {
-    if (!safeText) return '';
-    return safeText.replace(/(^|\s)@([A-Za-z0-9._-]+)/g, (match, prefix, handle) => {
-        return `${prefix}<span class="comment-mention">@${handle}</span>`;
-    });
-}
-
-function formatCommentContent(rawContent) {
-    const safe = escapeHtml(rawContent || '');
-    return highlightMentions(safe);
-}
-
-const MENTION_MAX_RESULTS = 8;
-
-function getMentionContext(text, caretPos) {
-    if (!text) return null;
-    const pos = typeof caretPos === 'number' ? caretPos : text.length;
-    const upto = text.slice(0, pos);
-    const atIndex = upto.lastIndexOf('@');
-    if (atIndex === -1) return null;
-    if (atIndex > 0) {
-        const prev = upto.charAt(atIndex - 1);
-        if (!/\s/.test(prev)) return null;
-    }
-    const query = upto.slice(atIndex + 1);
-    if (/\s/.test(query)) return null;
-    return {start: atIndex, end: pos, query};
-}
-
-function getMentionInsertValue(user) {
-    if (!user) return '';
-    const idCard = String(user.idCard || '').trim();
-    if (idCard) return idCard;
-    const displayName = String(user.displayName || '').trim();
-    if (displayName) return displayName;
-    const fullName = String(user.fullName || '').trim();
-    return fullName;
-}
-
-function initCommentMentionAutocomplete() {
-    const input = document.getElementById('input-comment');
-    if (!input) return;
-    if (input.dataset.mentionBound === '1') return;
-    input.dataset.mentionBound = '1';
-
-    const wrapper = input.closest('.comment-input') || input.parentElement;
-    if (!wrapper) return;
-
-    if (!USERS_CACHE || USERS_CACHE.length === 0) {
-        fetchUsers()
-            .then((users) => {
-                if (Array.isArray(users)) USERS_CACHE = users;
-            })
-            .catch(() => {});
-    }
-
-    let dropdown = wrapper.querySelector('.mention-suggestions');
-    if (!dropdown) {
-        dropdown = document.createElement('div');
-        dropdown.className = 'mention-suggestions';
-        wrapper.appendChild(dropdown);
-    }
-
-    const state = {matches: [], activeIndex: -1, context: null};
-
-    const hide = () => {
-        dropdown.classList.remove('active');
-        dropdown.innerHTML = '';
-        state.matches = [];
-        state.activeIndex = -1;
-        state.context = null;
-    };
-
-    const positionDropdown = () => {
-        dropdown.style.left = `${input.offsetLeft}px`;
-        dropdown.style.width = `${input.offsetWidth}px`;
-    };
-
-    const setActive = (index) => {
-        const items = dropdown.querySelectorAll('.mention-suggestion-item');
-        items.forEach((el, idx) => {
-            el.classList.toggle('is-active', idx === index);
-        });
-        state.activeIndex = index;
-    };
-
-    const selectByIndex = (index) => {
-        const user = state.matches[index];
-        const mentionValue = getMentionInsertValue(user);
-        if (!mentionValue || !state.context) return;
-        const value = input.value || '';
-        const before = value.slice(0, state.context.start);
-        const after = value.slice(state.context.end);
-        const insertText = `@${mentionValue} `;
-        input.value = `${before}${insertText}${after}`;
-        const newPos = before.length + insertText.length;
-        input.setSelectionRange(newPos, newPos);
-        hide();
-        input.focus();
-    };
-
-    const renderEmpty = () => {
-        positionDropdown();
-        dropdown.innerHTML = '<div class="mention-suggestion-empty">No users found</div>';
-        dropdown.classList.add('active');
-        state.activeIndex = -1;
-    };
-
-    const renderList = (matches) => {
-        positionDropdown();
-        dropdown.innerHTML = matches
-            .map((user, idx) => {
-                const idCard = String(user.idCard || '').trim();
-                const displayName = String(user.displayName || '').trim();
-                const fullName = String(user.fullName || '').trim();
-                const nameLine = idCard
-                    ? `@${escapeHtml(idCard)}${displayName ? ' - ' + escapeHtml(displayName) : ''}`
-                    : escapeHtml(displayName || fullName);
-                const metaLine =
-                    fullName && fullName !== displayName ? `<div class="mention-suggestion-meta">${escapeHtml(fullName)}</div>` : '';
-                return `
-                    <div class="mention-suggestion-item" data-index="${idx}">
-                        <div class="mention-suggestion-name">${nameLine}</div>
-                        ${metaLine}
-                    </div>`;
-            })
-            .join('');
-        dropdown.classList.add('active');
-        setActive(0);
-
-        dropdown.querySelectorAll('.mention-suggestion-item').forEach((item) => {
-            item.addEventListener('mousedown', (e) => {
-                e.preventDefault();
-                const index = Number(item.dataset.index || 0);
-                selectByIndex(index);
-            });
-            item.addEventListener('mouseenter', () => {
-                const index = Number(item.dataset.index || 0);
-                setActive(index);
-            });
-        });
-    };
-
-    const updateSuggestions = () => {
-        const value = input.value || '';
-        const caret = typeof input.selectionStart === 'number' ? input.selectionStart : value.length;
-        const context = getMentionContext(value, caret);
-        if (!context || !context.query || context.query.length < 1) {
-            hide();
-            return;
-        }
-
-        const matches = filterUsers(context.query).slice(0, MENTION_MAX_RESULTS);
-        state.matches = matches;
-        state.context = context;
-
-        if (!matches.length) {
-            renderEmpty();
-            return;
-        }
-
-        renderList(matches);
-    };
-
-    const onKeydown = (e) => {
-        if (!dropdown.classList.contains('active')) return;
-        if (!state.matches.length) {
-            if (e.key === 'Escape') hide();
-            return;
-        }
-
-        if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            const next = (state.activeIndex + 1) % state.matches.length;
-            setActive(next);
-        } else if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            const prev = (state.activeIndex - 1 + state.matches.length) % state.matches.length;
-            setActive(prev);
-        } else if (e.key === 'Enter' || e.key === 'Tab') {
-            e.preventDefault();
-            const index = state.activeIndex >= 0 ? state.activeIndex : 0;
-            selectByIndex(index);
-        } else if (e.key === 'Escape') {
-            e.preventDefault();
-            hide();
-        }
-    };
-
-    input.addEventListener('input', updateSuggestions);
-    input.addEventListener('click', updateSuggestions);
-    input.addEventListener('keydown', onKeydown);
-    input.addEventListener('blur', () => {
-        setTimeout(hide, 150);
-    });
-
-    if (!input._mentionDocHandler) {
-        input._mentionDocHandler = function (e) {
-            if (!wrapper.contains(e.target)) hide();
-        };
-        document.addEventListener('click', input._mentionDocHandler);
-    }
-}
+const PROJECT_TASK_TABLE_LABELS = window.PROJECT_TASK_TABLE_I18N;
 
 let USERS_CACHE = [];
-
-async function fetchUsers() {
-    try {
-        const res = await fetch('/ppap-system/api/users');
-        if (!res.ok) {
-            throw new Error(`Failed to fetch users: ${res.status} ${res.statusText}`);
-        }
-        const json = await res.json();
-        return json.result || [];
-    } catch (error) {
-        console.error('Error fetching users:', error);
-        return [];
-    }
-}
-
-function filterUsers(keyword) {
-    if (!keyword || keyword.length === 0) {
-        return USERS_CACHE;
-    }
-
-    const lowerKeyword = keyword.toLowerCase();
-    return USERS_CACHE.filter((user) => {
-        const idCard = (user.idCard || '').toLowerCase();
-        const fullName = (user.fullName || '').toLowerCase();
-        const displayName = (user.displayName || '').toLowerCase();
-
-        return idCard.includes(lowerKeyword) || fullName.includes(lowerKeyword) || displayName.includes(lowerKeyword);
-    });
-}
-
-function formatUserLabel(user) {
-    if (!user) return '';
-    const idCard = (user.idCard || '').trim();
-    const displayName = (user.displayName || '').trim();
-    if (!idCard && !displayName) return '';
-    return displayName ? `${idCard} - ${displayName}` : idCard;
-}
 
 function getUserLabelById(idCard) {
     if (!idCard) return '';
@@ -324,11 +20,6 @@ function getUserLabelById(idCard) {
     const found = USERS_CACHE.find((user) => (user.idCard || '').toString() === normalized);
     if (found) return formatUserLabel(found);
     return normalized;
-}
-
-function normalizeStatus(status) {
-    if (!status) return '';
-    return String(status).trim().toUpperCase().replace(/\s+/g, '_').replace(/-/g, '_');
 }
 
 function getStatusBadgeClass(status) {
@@ -356,17 +47,6 @@ function getStatusLabel(status) {
     return normalized.replace(/_/g, ' ');
 }
 
-function getPriorityBadgeClass(priority) {
-    if (!priority) return 'priority-medium';
-    const p = priority.toLowerCase();
-    return `priority-${p}`;
-}
-
-function getPriorityLabel(priority) {
-    if (!priority) return 'MEDIUM';
-    return priority.replace(/_/g, ' ');
-}
-
 function populateDriSelectOptions(selectEl, selectedValue) {
     if (!selectEl) return;
 
@@ -374,8 +54,6 @@ function populateDriSelectOptions(selectEl, selectedValue) {
 
     USERS_CACHE.forEach((user) => {
         const idCard = user.idCard || '';
-        const fullName = user.fullName || '';
-        const displayName = user.displayName || '';
         const option = document.createElement('option');
         option.value = idCard;
         option.textContent = formatUserLabel(user);
@@ -475,16 +153,7 @@ function initDriSelect2(selectEl, dropdownParent) {
             ev.preventDefault();
 
             try {
-                const res = await fetch(
-                    `/ppap-system/api/users/get-dri?idCard=${encodeURIComponent(term)}`
-                );
-                if (!res.ok) {
-                    console.error('get-dri failed:', res.status, res.statusText);
-                    return;
-                }
-
-                const json = await res.json();
-                const user = json.data || json.result || null;
+                const user = await api.fetchDriByIdCard(term);
                 if (!user) return;
 
                 const idCard = String(user.idCard || term).trim();
@@ -511,7 +180,7 @@ function initDriSelect2(selectEl, dropdownParent) {
 
 async function loadUsersAndInitDriSelects() {
     if (USERS_CACHE.length === 0) {
-        USERS_CACHE = await fetchUsers();
+        USERS_CACHE = await api.fetchUsers();
     }
 
     const filterCreatedBy = document.getElementById('filter-created-by');
@@ -525,14 +194,6 @@ function initCustomDriSelect2() {
     const modal = document.getElementById('customTaskModal');
     if (customDri && modal) {
         initDriSelect2(customDri, modal);
-    }
-}
-
-function initTaskDetailDriSelect2() {
-    const driInput = document.getElementById('dri');
-    const modal = document.getElementById('taskDetailModal');
-    if (driInput && modal) {
-        initDriSelect2(driInput, modal);
     }
 }
 
@@ -572,218 +233,7 @@ const Validators = {
     },
 };
 
-function openModal(modalId) {
-    const modalEl = typeof modalId === 'string' ? document.getElementById(modalId) : modalId;
-    if (!modalEl) {
-        return null;
-    }
-
-    try {
-        const modal = new bootstrap.Modal(modalEl);
-        modal.show();
-        return modal;
-    } catch (e) {
-        modalEl.classList.add('active');
-        return null;
-    }
-}
-
-function safeHideModal(modalEl) {
-    if (!modalEl) return;
-    try {
-        if (window.bootstrap && bootstrap.Modal) {
-            const inst = bootstrap.Modal.getInstance(modalEl);
-            if (inst && typeof inst.hide === 'function') {
-                inst.hide();
-            } else {
-                try {
-                    new bootstrap.Modal(modalEl).hide();
-                } catch (e) {
-                    modalEl.classList.remove('show', 'active');
-                }
-            }
-        } else {
-            modalEl.classList.remove('show', 'active');
-        }
-    } catch (e) {
-        try {
-            modalEl.classList.remove('show', 'active');
-        } catch (e2) {}
-    }
-    setTimeout(() => {
-        try {
-            const openModals = document.querySelectorAll('.modal.show');
-            const backdrops = document.querySelectorAll('.modal-backdrop');
-
-            if (backdrops.length > openModals.length) {
-                for (let i = openModals.length; i < backdrops.length; i++) {
-                    if (backdrops[i] && backdrops[i].parentNode) {
-                        backdrops[i].parentNode.removeChild(backdrops[i]);
-                    }
-                }
-            }
-
-            if (openModals.length === 0) {
-                document.body.classList.remove('modal-open');
-                document.body.style.paddingRight = '';
-                document.body.style.overflow = '';
-            }
-        } catch (e) {}
-    }, 150);
-}
-
-function cleanUpModal() {
-    try {
-        const openModals = document.querySelectorAll('.modal.show');
-        const anyOpen = openModals.length > 0;
-
-        if (!anyOpen) {
-            const backdrops = document.querySelectorAll('.modal-backdrop');
-            backdrops.forEach((b) => {
-                try {
-                    if (b && b.parentNode) {
-                        b.parentNode.removeChild(b);
-                    }
-                } catch (e) {}
-            });
-            try {
-                document.body.classList.remove('modal-open');
-                document.body.style.paddingRight = '';
-                document.body.style.overflow = '';
-            } catch (e) {}
-        } else {
-            try {
-                const backdrops = Array.from(document.querySelectorAll('.modal-backdrop'));
-                const openCount = openModals.length;
-
-                if (backdrops.length > openCount) {
-                    for (let i = openCount; i < backdrops.length; i++) {
-                        try {
-                            if (backdrops[i] && backdrops[i].parentNode) {
-                                backdrops[i].parentNode.removeChild(backdrops[i]);
-                            }
-                        } catch (e) {}
-                    }
-                }
-            } catch (e) {}
-        }
-    } catch (e) {}
-}
-
-document.addEventListener('hidden.bs.modal', function (ev) {
-    setTimeout(() => {
-        cleanUpModal();
-    }, 10);
-});
-function showAlertSuccess(title, text) {
-    Swal.fire({
-        title: title,
-        text: text,
-        icon: 'success',
-        customClass: 'swal-success',
-        buttonsStyling: true,
-    });
-}
-
-function showAlertError(title, text) {
-    Swal.fire({
-        title: title,
-        text: text,
-        icon: 'error',
-        customClass: 'swal-error',
-        buttonsStyling: true,
-    });
-}
-
-function showAlertWarning(title, text) {
-    Swal.fire({
-        title: title,
-        text: text,
-        icon: 'warning',
-        customClass: 'swal-warning',
-        buttonsStyling: true,
-    });
-}
-
-function extractApiMessage(payload) {
-    if (!payload) return '';
-    if (typeof payload === 'string') return payload.trim();
-
-    const pick = (value) => (typeof value === 'string' && value.trim() ? value.trim() : '');
-    const direct =
-        pick(payload.message) ||
-        pick(payload.error) ||
-        pick(payload.errorMessage) ||
-        pick(payload.msg) ||
-        pick(payload.detail);
-    if (direct) return direct;
-
-    if (payload.result && typeof payload.result === 'object') {
-        const nested =
-            pick(payload.result.message) ||
-            pick(payload.result.error) ||
-            pick(payload.result.errorMessage) ||
-            pick(payload.result.msg);
-        if (nested) return nested;
-    }
-
-    if (payload.data && typeof payload.data === 'object') {
-        const nested =
-            pick(payload.data.message) ||
-            pick(payload.data.error) ||
-            pick(payload.data.errorMessage) ||
-            pick(payload.data.msg);
-        if (nested) return nested;
-    }
-
-    if (Array.isArray(payload.errors)) {
-        const parts = payload.errors
-            .map((item) => {
-                if (typeof item === 'string') return item.trim();
-                if (item && typeof item === 'object') {
-                    return pick(item.message) || pick(item.error) || pick(item.msg);
-                }
-                return '';
-            })
-            .filter(Boolean);
-        if (parts.length) return parts.join(', ');
-    }
-
-    if (payload.errors && typeof payload.errors === 'object') {
-        const parts = Object.values(payload.errors)
-            .map((item) => (typeof item === 'string' ? item.trim() : ''))
-            .filter(Boolean);
-        if (parts.length) return parts.join(', ');
-    }
-
-    return '';
-}
-
-async function getApiErrorMessage(res, fallback) {
-    const fallbackMsg = fallback || (res && res.status ? `Request failed (${res.status})` : 'Request failed');
-
-    if (!res) return fallbackMsg;
-
-    try {
-        const contentType = res.headers && res.headers.get ? res.headers.get('content-type') || '' : '';
-        if (contentType.includes('application/json')) {
-            const json = await res.json();
-            const message = extractApiMessage(json);
-            return message || fallbackMsg;
-        }
-
-        const text = await res.text();
-        if (text && text.trim()) return text.trim();
-    } catch (e) {}
-
-    return fallbackMsg;
-}
-
-
-
-
-
-
+ 
 
 function parseTaskUpdates(content) {
     const fieldMatches = content.matchAll(/\[(\w+):/g);
@@ -840,7 +290,7 @@ async function handleAddCustomTask() {
             if (String(projectId).startsWith('TEMP-')) {
                 const persistedId = await ensureProjectPersisted(currentProject);
                 if (!persistedId) {
-                    showAlertError('Failed', 'Unable to save project. Please try again.');
+                    ui.showAlertError('Failed', 'Unable to save project. Please try again.');
                     return;
                 }
                 projectId = persistedId;
@@ -856,11 +306,11 @@ async function handleAddCustomTask() {
         if (projectId !== null && projectId !== undefined && projectId !== '') {
             projectId = Number(projectId);
             if (isNaN(projectId) || projectId <= 0) {
-                showAlertError('Failed', 'Invalid project ID');
+                ui.showAlertError('Failed', 'Invalid project ID');
                 return;
             }
         } else {
-            showAlertError('Failed', 'Please select a project before adding a task');
+            ui.showAlertError('Failed', 'Please select a project before adding a task');
             return;
         }
 
@@ -893,7 +343,7 @@ async function handleAddCustomTask() {
         if (!res.ok) {
             const message = await getApiErrorMessage(res, `Failed to create task: (${res.status})`);
             console.error('Create task failed:', res.status, message);
-            showAlertError('Failed', message);
+            ui.showAlertError('Failed', message);
             return;
         }
 
@@ -902,7 +352,7 @@ async function handleAddCustomTask() {
             const json = await res.json();
             newTask = json.data || json.result || json;
         } catch (e) {}
-        showAlertSuccess('Success', 'Task created successfully!');
+        ui.showAlertSuccess('Success', 'Task created successfully!');
         try {
             bootstrap.Modal.getInstance(document.getElementById('customTaskModal')).hide();
         } catch (e) {
@@ -984,7 +434,7 @@ async function handleAddCustomTask() {
         } catch (e) {}
     } catch (e) {
         console.error('handleAddCustomTask error:', e);
-        showAlertError('Error', e.message || 'An error occurred while creating the task');
+        ui.showAlertError('Error', e.message || 'An error occurred while creating the task');
     }
 }
 
@@ -1041,12 +491,7 @@ async function ensureCftNameMapForCustomer(customerId) {
     if (CFT_NAME_MAP_BY_CUSTOMER[cid]) return CFT_NAME_MAP_BY_CUSTOMER[cid];
 
     try {
-        const res = await fetch(`/ppap-system/api/cft?customerId=${encodeURIComponent(cid)}`);
-        if (!res.ok) {
-            throw new Error(`Error: ${res.status} ${res.statusText}`);
-        }
-        const json = await res.json();
-        const items = json.data || [];
+        const items = await api.fetchCftTeams(cid);
         const map = items.reduce((acc, item) => {
             if (!item || item.id === null || item.id === undefined) return acc;
             acc[String(item.id).trim()] = item.name || item.label || String(item.id);
@@ -1108,19 +553,6 @@ function sortStagesByName(stages) {
         });
 }
 
-async function fetchStagesForProject(projectId) {
-    if (!projectId) return [];
-    try {
-        const res = await fetch(`/ppap-system/api/stages?projectId=${encodeURIComponent(projectId)}`);
-        if (!res.ok) throw new Error(`Error: ${res.status} ${res.statusText}`);
-        const json = await res.json();
-        return json.data || [];
-    } catch (e) {
-        console.error('fetchStagesForProject failed:', e);
-        return [];
-    }
-}
-
 function resolveActiveStageId(projectId, stages, preferredStageId) {
     const pid = String(projectId);
     const hasStage = (id) => stages.some((s) => String(s.id) === String(id));
@@ -1152,13 +584,13 @@ function renderProjectStageTabs(projectId, stages, activeStageId) {
                 <button type="button"
                     class="stage-tab${isActive ? ' active' : ''}"
                     data-stage-id="${stage.id}">
-                    ${escapeHtml(stage.name || '')}
+                    ${ui.escapeHtml(stage.name || '')}
                 </button>
             `;
         })
         .join('');
 
-    container.innerHTML = `<span class="stage-tabs-label">${escapeHtml(labelText)}</span>${buttonsHtml}`;
+    container.innerHTML = `<span class="stage-tabs-label">${ui.escapeHtml(labelText)}</span>${buttonsHtml}`;
 }
 
 function setProjectTasksActionButtonsState(hasStage) {
@@ -1249,9 +681,6 @@ async function loadProjectTasksByStage(projectId, stageId, options) {
     if (isNaN(pid)) return;
     const opts = options || {};
 
-    const qs = stageId ? `?stageId=${encodeURIComponent(stageId)}` : '';
-    const url = `/ppap-system/api/project/${pid}/tasks${qs}`;
-
     const container = document.getElementById('projectTasksContent');
     if (container) {
         container.innerHTML = `<div style="text-align:center;padding:20px;color:var(--text-secondary)"><i class="bi bi-hourglass-split"></i> Loading tasks...</div>`;
@@ -1259,10 +688,11 @@ async function loadProjectTasksByStage(projectId, stageId, options) {
 
     try {
         if (!opts.skipLoader) loader.load();
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`Status ${res.status} ${res.statusText}`);
-        const json = await res.json();
-        const tasks = Array.isArray(json.data) ? json.data : [];
+        const taskParams = stageId ? {stageId} : {};
+        const tasks = await api.fetchProjectTasks(pid, taskParams);
+        if (tasks === null) {
+            throw new Error('Failed to load tasks');
+        }
 
         setCurrentStageState(pid, stageId, tasks);
         setActiveStageTab(pid, stageId);
@@ -1283,7 +713,7 @@ async function loadProjectTasksByStage(projectId, stageId, options) {
 
 async function loadProjectStagesAndTasks(projectId, preferredStageId, options) {
     const opts = options || {};
-    const stagesRaw = await fetchStagesForProject(projectId);
+    const stagesRaw = await api.fetchStagesForProject(projectId);
     const stages = sortStagesByName(stagesRaw);
     if (stages.length) {
         const existing = SELECT_CACHE['/api/stages'] || [];
@@ -1302,73 +732,29 @@ async function loadProjectStagesAndTasks(projectId, preferredStageId, options) {
     await loadProjectTasksByStage(projectId, activeStageId, {skipLoader: opts.skipLoader});
 }
 
-async function fetchOptions(endpoint) {
-    try {
-        const res = await fetch(`/ppap-system${endpoint}`);
-        if (!res.ok) {
-            throw new Error(`Error: ${res.status} ${res.statusText}`);
-        }
-        const json = await res.json();
-        return json.data || [];
-    } catch (error) {
-        console.error(`Error calling API ${endpoint}:`, error);
-        return [];
-    }
-}
-
-function renderOptions(selectId, items) {
-    const select = document.getElementById(selectId);
-    if (!select) return;
-
-    const currentValue = select.value;
-
-    let optionsHtml = '';
-    optionsHtml += `<option value="">--Select--</option>`;
-    optionsHtml += items
-        .map((item) => {
-            if (typeof item === 'string' || typeof item === 'number') {
-                return `<option value="${item}">${item}</option>`;
-            } else if (item && typeof item === 'object' && item.id && item.name) {
-                return `<option value="${item.id}">${item.name}</option>`;
-            }
-            return '';
-        })
-        .join('');
-
-    select.innerHTML = optionsHtml;
-    if (currentValue) {
-        select.value = currentValue;
-    }
-}
-
 async function loadCftTeamsForSelect(selectId, customerId) {
     const selectEl = document.getElementById(selectId);
     if (!selectEl) return;
 
     const cid = customerId ? String(customerId).trim() : '';
     if (!cid) {
-        renderOptions(selectId, []);
+        ui.renderOptions(selectId, []);
         return;
     }
 
     try {
-        const res = await fetch(`/ppap-system/api/cft?customerId=${encodeURIComponent(cid)}`);
-        if (!res.ok) {
-            throw new Error(`Error: ${res.status} ${res.statusText}`);
-        }
-        const json = await res.json();
-        const items = json.data || [];
-        renderOptions(selectId, items);
+        const items = await api.fetchCftTeams(cid);
+        ui.renderOptions(selectId, items);
         SELECT_CACHE['/api/cft'] = items;
     } catch (error) {
         console.error('Error calling API /api/cft:', error);
-        renderOptions(selectId, []);
+        ui.renderOptions(selectId, []);
     }
 }
 
 async function loadAllSelects() {
     const endpoints = Array.from(new Set(SELECT_CONFIGS.map((cfg) => cfg.endpoint)));
-    const results = await Promise.all(endpoints.map((endpoint) => fetchOptions(endpoint)));
+    const results = await Promise.all(endpoints.map((endpoint) => api.fetchOptions(endpoint)));
     const endpointResultMap = endpoints.reduce((acc, endpoint, idx) => {
         acc[endpoint] = results[idx] || [];
         return acc;
@@ -1376,14 +762,14 @@ async function loadAllSelects() {
 
     SELECT_CONFIGS.forEach((cfg) => {
         const items = endpointResultMap[cfg.endpoint] || [];
-        renderOptions(cfg.id, items);
+        ui.renderOptions(cfg.id, items);
         SELECT_CACHE[cfg.endpoint] = items;
     });
 
     const customers = endpointResultMap['/api/customers'] || [];
     SELECT_CACHE['/api/customers'] = customers;
-    renderOptions('projectCustomerSelect', customers);
-    renderOptions('newProjectCustomer', customers);
+    ui.renderOptions('projectCustomerSelect', customers);
+    ui.renderOptions('newProjectCustomer', customers);
 
     try {
         const customerEl = document.getElementById('newProjectCustomer');
@@ -1398,31 +784,31 @@ async function loadAllSelects() {
     } catch (e) {}
 
     try {
-        const stages = endpointResultMap['/api/stages'] || (await fetchOptions('/api/stages'));
-        renderOptions('sl-xvt', stages);
+        const stages = endpointResultMap['/api/stages'] || (await api.fetchOptions('/api/stages'));
+        ui.renderOptions('sl-xvt', stages);
         SELECT_CACHE['/api/stages'] = stages;
     } catch (e) {}
 
     try {
-        const statuses = endpointResultMap['/api/tasks/status'] || (await fetchOptions('/api/tasks/status'));
-        renderOptions('modal-sl-status', statuses);
+        const statuses = endpointResultMap['/api/tasks/status'] || (await api.fetchOptions('/api/tasks/status'));
+        ui.renderOptions('modal-sl-status', statuses);
         SELECT_CACHE['/api/tasks/status'] = statuses;
 
         try {
             const projStatuses =
-                endpointResultMap['/api/projects/status'] || (await fetchOptions('/api/projects/status'));
-            renderOptions('ppapFilterProjectStatus', projStatuses);
+                endpointResultMap['/api/projects/status'] || (await api.fetchOptions('/api/projects/status'));
+            ui.renderOptions('ppapFilterProjectStatus', projStatuses);
             SELECT_CACHE['/api/projects/status'] = projStatuses;
         } catch (e) {}
 
         const priorities =
-            endpointResultMap['/api/tasks/priorities'] || (await fetchOptions('/api/tasks/priorities'));
-        renderOptions('modal-sl-priority', priorities);
+            endpointResultMap['/api/tasks/priorities'] || (await api.fetchOptions('/api/tasks/priorities'));
+        ui.renderOptions('modal-sl-priority', priorities);
         SELECT_CACHE['/api/tasks/priorities'] = priorities;
 
         try {
-            const processes = endpointResultMap['/api/processes'] || (await fetchOptions('/api/processes'));
-            renderOptions('sl-type', processes);
+            const processes = endpointResultMap['/api/processes'] || (await api.fetchOptions('/api/processes'));
+            ui.renderOptions('sl-type', processes);
             SELECT_CACHE['/api/processes'] = processes;
         } catch (e) {}
     } catch (e) {}
@@ -1578,12 +964,9 @@ async function ensureProjectPersisted(project) {
 
         for (let attempt = 0; attempt < 5; attempt++) {
             try {
-                const res = await fetch(
-                    '/ppap-system/api/projects' + (params.toString() ? '?' + params.toString() : '')
-                );
+                const {res, json} = await api.fetchProjectsRaw(params);
                 if (res.ok) {
-                    const json = await res.json();
-                    const list = Array.isArray(json.data) ? json.data : Array.isArray(json) ? json : [];
+                    const list = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : [];
                     if (list && list.length) {
                         const found = list.find(
                             (p) =>
@@ -1621,10 +1004,8 @@ async function fetchCurrentUserIdCard() {
     if (CURRENT_USER_IDCARD_LOADED) return CURRENT_USER_IDCARD;
     CURRENT_USER_IDCARD_LOADED = true;
     try {
-        const res = await fetch('/ppap-system/api/users/get-profile');
-        if (!res.ok) return null;
-        const json = await res.json();
-        const profile = json && (json.data || json.result) ? json.data || json.result : null;
+        const profile = await api.fetchUserProfile();
+        if (!profile) return null;
         const idCard =
             profile && profile.idCard !== undefined && profile.idCard !== null ? String(profile.idCard).trim() : '';
         CURRENT_USER_IDCARD = idCard || null;
@@ -1637,79 +1018,6 @@ async function fetchCurrentUserIdCard() {
 function setTaskDetailSignPermission(modalRoot, canSign) {
     if (!modalRoot) return;
     modalRoot.dataset.canSign = canSign ? '1' : '0';
-}
-
-async function fetchSignFlowItems(taskId) {
-    if (!taskId) return [];
-    const res = await fetch(`/ppap-system/api/tasks/${encodeURIComponent(taskId)}/sign-flow`);
-    if (!res.ok) return [];
-    const json = await res.json();
-    return Array.isArray(json?.data) ? json.data : [];
-}
-
-
-
-function rangePicker($input, fromDate, toDate) {
-    let start = null;
-    let end = null;
-    if (window.moment) {
-        try {
-            const mStart = window.moment((fromDate || '').split(' ')[0], 'YYYY/MM/DD', true);
-            if (mStart && typeof mStart.isValid === 'function' && mStart.isValid()) start = mStart;
-        } catch (e) {
-            start = null;
-        }
-
-        try {
-            const mEnd = window.moment((toDate || '').split(' ')[0], 'YYYY/MM/DD', true);
-            if (mEnd && typeof mEnd.isValid === 'function' && mEnd.isValid()) end = mEnd;
-        } catch (e) {
-            end = null;
-        }
-    }
-
-    const fallbackStart = window.moment
-        ? window.moment().subtract(3, 'months')
-        : new Date(new Date().setMonth(new Date().getMonth() - 3));
-
-    $input.daterangepicker({
-        startDate: start || fallbackStart,
-        endDate: end || (window.moment ? window.moment() : new Date()),
-        autoApply: false,
-        locale: {format: 'YYYY/MM/DD'},
-    });
-
-    const startValue = formatDateForFilterInput(start || fallbackStart);
-    const endValue = formatDateForFilterInput(end || (window.moment ? window.moment() : new Date()));
-    if (typeof $input.val === 'function' && startValue && endValue) {
-        $input.val(`${startValue} - ${endValue}`);
-    }
-}
-
-function singlePicker($input, workDate, withTime) {
-    const raw = String(workDate || '').trim();
-    let start = null;
-    if (window.moment) {
-        try {
-            const formats = withTime
-                ? ['YYYY/MM/DD HH:mm:ss', 'YYYY/MM/DD HH:mm', 'YYYY-MM-DD HH:mm:ss', 'YYYY-MM-DD HH:mm']
-                : ['YYYY/MM/DD', 'YYYY-MM-DD'];
-            const m = window.moment(raw, formats, true);
-            if (m && typeof m.isValid === 'function' && m.isValid()) start = m;
-        } catch (e) {
-            start = null;
-        }
-    }
-
-    $input.daterangepicker({
-        singleDatePicker: true,
-        startDate: start || new Date(),
-        autoApply: false,
-        timePicker: !!withTime,
-        timePicker24Hour: !!withTime,
-        timePickerSeconds: !!withTime,
-        locale: {format: withTime ? 'YYYY/MM/DD HH:mm:ss' : 'YYYY/MM/DD'},
-    });
 }
 
 function mapCustomerToId(cust) {
@@ -1783,15 +1091,12 @@ async function loadProjectList(page = projectListCurrentPage, size = projectList
         params.set('page', projectListCurrentPage);
         params.set('size', projectListPageSize);
 
-        const base = '/ppap-system/api/projects';
-        const url = params.toString() ? `${base}?${params.toString()}` : base;
-        const res = await fetch(url);
+        const {res, json} = await api.fetchProjectsRaw(params);
 
-        if (!res.ok) {
-            const message = await getApiErrorMessage(res, `Failed to load projects (${res.status})`);
-            showAlertError('Failed', message);
+        if (!res || !res.ok) {
+            const message = await getApiErrorMessage(res, `Failed to load projects (${res ? res.status : 'N/A'})`);
+            ui.showAlertError('Failed', message);
         } else {
-            const json = await res.json();
             const payload =
                 (json && Array.isArray(json.data) && json.data) ||
                 (json && Array.isArray(json.result) && json.result) ||
@@ -1832,7 +1137,7 @@ async function loadProjectList(page = projectListCurrentPage, size = projectList
         }
     } catch (error) {
         console.error('loadProjectList failed', error);
-        showAlertError('Error', 'Failed to load project list. Please try again.');
+        ui.showAlertError('Error', 'Failed to load project list. Please try again.');
     } finally {
         loader.unload();
     }
@@ -1932,7 +1237,7 @@ async function filterProjects() {
         await loadProjectList(1);
     } catch (e) {
         console.error('filterProjects failed', e);
-        showAlertError('Error', 'Filtering failed');
+        ui.showAlertError('Error', 'Filtering failed');
     }
 }
 
@@ -2159,7 +1464,7 @@ function updateProjectListPagination() {
 function getStatusBadge(status) {
     const statusClass = getStatusBadgeClass(status);
     const label = getStatusLabel(status);
-    return `<span class="task-status-badge ${statusClass}">${escapeHtml(label)}</span>`;
+    return `<span class="task-status-badge ${statusClass}">${ui.escapeHtml(label)}</span>`;
 }
 
 function getCustomerDisplay(cust) {
@@ -2313,13 +1618,13 @@ async function deleteTaskDocument(documentId, taskId) {
             throw new Error(message);
         }
 
-        showAlertSuccess('Deleted', 'Document deleted successfully');
+        ui.showAlertSuccess('Deleted', 'Document deleted successfully');
         if (currentTaskId) {
             await fetchAndRenderAttachments(currentTaskId);
         }
     } catch (e) {
         console.error('deleteTaskDocument error', e);
-        showAlertError('Failed', e && e.message ? e.message : 'Failed to delete document.');
+        ui.showAlertError('Failed', e && e.message ? e.message : 'Failed to delete document.');
     } finally {
         loader.unload();
     }
@@ -2327,13 +1632,13 @@ async function deleteTaskDocument(documentId, taskId) {
 
 async function showProjectTasksModal(projectId) {
     if (!projectId || projectId === 'null' || projectId === 'undefined') {
-        showAlertWarning('Warning', 'Invalid project ID');
+        ui.showAlertWarning('Warning', 'Invalid project ID');
         return;
     }
 
     const parsedId = parseInt(projectId, 10);
     if (isNaN(parsedId)) {
-        showAlertWarning('Warning', 'Invalid project ID');
+        ui.showAlertWarning('Warning', 'Invalid project ID');
         return;
     }
 
@@ -2447,19 +1752,15 @@ async function showProjectTasksModal(projectId) {
     openProjectTasksModal();
 
     try {
-        const url = new URL(window.location.href);
-        url.searchParams.set('projectId', String(projectId));
-        window.history.pushState({projectId: projectId}, '', url.toString());
+        setQueryParam('projectId', projectId, {state: {projectId: projectId}});
     } catch (e) {}
 
     try {
         loader.load();
-        const res = await fetch(`/ppap-system/api/project/${projectId}/tasks`);
-
-        if (!res.ok) throw new Error(`Status ${res.status} ${res.statusText}`);
-
-        const json = await res.json();
-        const tasks = Array.isArray(json.data) ? json.data : [];
+        const tasks = await api.fetchProjectTasks(projectId);
+        if (tasks === null) {
+            throw new Error('Failed to load tasks');
+        }
 
         if (project) {
             project.tasks = tasks.slice();
@@ -2497,17 +1798,17 @@ function renderProjectTasksContent(tasks, projectId) {
 
                 const statusClass = getStatusBadgeClass(t.status);
                 const statusLabel = getStatusLabel(t.status);
-                const statusBadge = `<span class="task-status-badge ${statusClass}">${escapeHtml(statusLabel)}</span>`;
+                const statusBadge = `<span class="task-status-badge ${statusClass}">${ui.escapeHtml(statusLabel)}</span>`;
 
                 const priorityClass = getPriorityBadgeClass(t.priority);
                 const priorityLabel = getPriorityLabel(t.priority);
-                const priorityBadge = `<span class="priority-badge ${priorityClass}">${escapeHtml(
+                const priorityBadge = `<span class="priority-badge ${priorityClass}">${ui.escapeHtml(
                     priorityLabel
                 )}</span>`;
 
-                const stageName = escapeHtml(getStageName(t.stageId) || '');
-                const processName = escapeHtml(getProcessName(t.processId) || '');
-                const driDisplay = escapeHtml(getUserLabelById(t.dri) || t.dri || '');
+                const stageName = ui.escapeHtml(getStageName(t.stageId) || '');
+                const processName = ui.escapeHtml(getProcessName(t.processId) || '');
+                const driDisplay = ui.escapeHtml(getUserLabelById(t.dri) || t.dri || '');
 
                 return `
             <tr draggable="true" 
@@ -2519,14 +1820,14 @@ function renderProjectTasksContent(tasks, projectId) {
                     <i class="bi bi-grip-vertical" title="Drag" aria-hidden="true"></i>
                 </td>
                 <td style="width:48px">${t.step || index + 1}</td>
-                <td>${escapeHtml(t.taskCode || '')}</td>
-                <td>${escapeHtml(t.name || '')}</td>
+                <td>${ui.escapeHtml(t.taskCode || '')}</td>
+                <td>${ui.escapeHtml(t.name || '')}</td>
                 <td>${stageName}</td>
                 <td>${processName}</td>
                 <td>${statusBadge}</td>
                 <td>${priorityBadge}</td>
                 <td>${driDisplay}</td>
-                <td>${escapeHtml(t.dueDate || '')}</td>
+                <td>${ui.escapeHtml(t.dueDate || '')}</td>
                 <td style="text-align:center">
                     <button class="action-btn-sm btn-danger" data-action="removeTaskFromProject" data-project-id="${projectId}" data-task-id="${t.id}" data-stop-prop="1" title="Remove">
                         <i class="bi bi-trash"></i>
@@ -2572,11 +1873,11 @@ function renderProjectTasksContent(tasks, projectId) {
 }
 
 async function refreshStageOptions(projectId) {
-    const stages = await fetchOptions('/api/stages');
+    const stages = await api.fetchOptions('/api/stages');
     let mergedStages = stages;
 
     if (projectId) {
-        const projectStages = await fetchStagesForProject(projectId);
+        const projectStages = await api.fetchStagesForProject(projectId);
         const map = {};
         stages.forEach((s) => {
             if (s && s.id !== null && s.id !== undefined) map[String(s.id)] = s;
@@ -2588,9 +1889,9 @@ async function refreshStageOptions(projectId) {
     }
 
     SELECT_CACHE['/api/stages'] = mergedStages;
-    renderOptions('sl-xvt', mergedStages);
-    renderOptions('custom-sl-xvt', mergedStages);
-    renderOptions('ppapFilterStage', mergedStages);
+    ui.renderOptions('sl-xvt', mergedStages);
+    ui.renderOptions('custom-sl-xvt', mergedStages);
+    ui.renderOptions('ppapFilterStage', mergedStages);
 }
 
 
@@ -2601,7 +1902,7 @@ async function handleCreateStageConfirm() {
     const name = input ? String(input.value || '').trim() : '';
 
     if (!name) {
-        showAlertWarning('Warning', 'Stage name is required');
+        ui.showAlertWarning('Warning', 'Stage name is required');
         if (input && typeof input.focus === 'function') input.focus();
         return;
     }
@@ -2609,7 +1910,7 @@ async function handleCreateStageConfirm() {
     const projectId = document.getElementById('pt_detail_projectId')?.value;
     const parsedProjectId = projectId ? parseInt(projectId, 10) : null;
     if (!parsedProjectId || Number.isNaN(parsedProjectId)) {
-        showAlertWarning('Warning', 'Project ID not found');
+        ui.showAlertWarning('Warning', 'Project ID not found');
         return;
     }
 
@@ -2625,7 +1926,7 @@ async function handleCreateStageConfirm() {
 
         if (!res.ok) {
             const message = await getApiErrorMessage(res, `Create stage failed (${res.status})`);
-            showAlertError('Failed', message);
+            ui.showAlertError('Failed', message);
             return;
         }
 
@@ -2636,19 +1937,19 @@ async function handleCreateStageConfirm() {
 
         if (json && (json.status === 'ERROR' || json.success === false)) {
             const message = extractApiMessage(json) || 'Failed to create stage';
-            showAlertError('Failed', message);
+            ui.showAlertError('Failed', message);
             return;
         }
 
-        showAlertSuccess('Success', 'Stage created successfully');
-        safeHideModal(modalEl);
+        ui.showAlertSuccess('Success', 'Stage created successfully');
+        ui.safeHideModal(modalEl);
         const createdStage = json ? json.data || json.result || null : null;
         const createdStageId = createdStage && createdStage.id ? createdStage.id : null;
         await refreshStageOptions(parsedProjectId);
         await loadProjectStagesAndTasks(parsedProjectId, createdStageId, {skipLoader: true});
     } catch (e) {
         console.error('Create stage error:', e);
-        showAlertError('Failed', e && e.message ? e.message : 'Failed to create stage');
+        ui.showAlertError('Failed', e && e.message ? e.message : 'Failed to create stage');
     } finally {
         loader.unload();
     }
@@ -2793,12 +2094,12 @@ function openProjectTasksModal() {
 function showEditTaskModal(projectId, taskId) {
     const project = projectList.find((p) => String(p.id) === String(projectId));
     if (!project) {
-        showAlertError('Error', 'Project not found');
+        ui.showAlertError('Error', 'Project not found');
         return;
     }
     const task = (project.tasks || []).find((t) => String(t.id) === String(taskId));
     if (!task) {
-        showAlertError('Error', 'Task not found');
+        ui.showAlertError('Error', 'Task not found');
         return;
     }
 
@@ -2825,9 +2126,7 @@ function showTaskDetailModal(projectId, taskId) {
     return openTaskDetail(taskId, projectId, {
         onBeforeOpen: ({taskId, projectId}) => {
             try {
-                const url = new URL(window.location.href);
-                url.searchParams.set('taskId', String(taskId));
-                window.history.pushState({taskId, projectId: projectId || null}, '', url.toString());
+                setQueryParam('taskId', taskId, {state: {taskId, projectId: projectId || null}});
             } catch (e) {}
         },
     });
@@ -2840,7 +2139,7 @@ function saveEditedTask() {
     const taskId = getEl('editTaskId').value;
     const project = projectList.find((p) => String(p.id) === String(projectId));
     if (!project) {
-        showAlertError('Error', 'Project not found');
+        ui.showAlertError('Error', 'Project not found');
         return;
     }
 
@@ -2870,13 +2169,13 @@ function saveEditedTask() {
             getEl('editTaskModal').classList.remove('active');
         }
         showProjectTasksModal(projectId);
-        showAlertSuccess('Success', 'Task added successfully');
+        ui.showAlertSuccess('Success', 'Task added successfully');
         return;
     }
 
     const taskIndex = (project.tasks || []).findIndex((t) => String(t.id) === String(taskId));
     if (taskIndex === -1) {
-        showAlertError('Error', 'Task not found');
+        ui.showAlertError('Error', 'Task not found');
         return;
     }
 
@@ -2897,7 +2196,7 @@ function saveEditedTask() {
         getEl('editTaskModal').classList.remove('active');
     }
     showProjectTasksModal(projectId);
-    showAlertSuccess('Success', 'Task saved');
+    ui.showAlertSuccess('Success', 'Task saved');
 }
 
 
@@ -2942,13 +2241,13 @@ async function saveProjectTaskQuantity() {
     if (!project) {
         const projName = getEl('pt_detail_projectName') ? getElValue(getEl('pt_detail_projectName')) : null;
         if (!projName) {
-            showAlertError('Error', 'Project not found');
+            ui.showAlertError('Error', 'Project not found');
             return;
         }
         project = projectList.find((p) => p.name === projName);
     }
     if (!project) {
-        showAlertError('Error', 'Project not found');
+        ui.showAlertError('Error', 'Project not found');
         return;
     }
 
@@ -2980,7 +2279,7 @@ async function saveProjectTaskQuantity() {
         if (taskIds.length > 0) {
             const resolvedId = await ensureProjectPersisted(project);
             if (!resolvedId) {
-                showAlertError('Failed', 'Unable to save tasks for project: project id not found on server');
+                ui.showAlertError('Failed', 'Unable to save tasks for project: project id not found on server');
             } else {
                 const customerIdForSave = mapCustomerToId(project.customer);
                 const saveOk = await saveTasksForProject(
@@ -2991,7 +2290,7 @@ async function saveProjectTaskQuantity() {
                     stageId
                 );
                 if (saveOk) {
-                    showAlertSuccess('Success', 'Project details and tasks updated successfully');
+                    ui.showAlertSuccess('Success', 'Project details and tasks updated successfully');
                     if (stageId) delete STANDARD_PPAP_STAGE_BY_PROJECT[String(resolvedId)];
                     await loadProjectList();
                     try {
@@ -3002,7 +2301,7 @@ async function saveProjectTaskQuantity() {
                 }
             }
         } else {
-            showAlertSuccess('Success', 'Project details updated successfully');
+            ui.showAlertSuccess('Success', 'Project details updated successfully');
             await loadProjectList();
             try {
                 if (project && project.id) {
@@ -3014,7 +2313,7 @@ async function saveProjectTaskQuantity() {
         }
     } catch (e) {
         console.error('Error while saving project tasks:', e);
-        showAlertError('Error', 'Project details updated locally but saving tasks failed. See console for details.');
+        ui.showAlertError('Error', 'Project details updated locally but saving tasks failed. See console for details.');
     }
 }
 
@@ -3030,7 +2329,7 @@ function showAddTaskModal(projectId) {
         }
     }
     if (!pid) {
-        showAlertError('Error', 'Project not found');
+        ui.showAlertError('Error', 'Project not found');
         return;
     }
 
@@ -3054,16 +2353,26 @@ async function removeTaskFromProject(projectId, taskId) {
     const project = projectList.find((p) => String(p.id) === String(projectId));
     if (!project) return;
 
-    if (!confirm('Do you want to delete ?')) return;
-
     try {
+        const confirmation = await Swal.fire({
+            title: 'Confirm Delete',
+            text: 'Are you sure you want to delete this task?',
+            icon: 'warning',
+            showCancelButton: true,
+            confirmButtonText: 'Yes, delete',
+            cancelButtonText: 'Cancel',
+        });
+
+        if (!confirmation.isConfirmed) return;
+
+        loader.load();
         const res = await fetch(`/ppap-system/api/tasks/delete?id=${encodeURIComponent(taskId)}`, {
             method: 'POST',
         });
 
         if (!res.ok) {
             const message = await getApiErrorMessage(res, `Failed to delete task (${res.status})`);
-            showAlertError('Failed', message);
+            ui.showAlertError('Failed', message);
             return;
         }
 
@@ -3075,7 +2384,7 @@ async function removeTaskFromProject(projectId, taskId) {
         const serverOk = json ? json.status === 'OK' || json.success === true || json.result === 'OK' : true;
         if (!serverOk) {
             const message = extractApiMessage(json) || 'Server reported failure when deleting task.';
-            showAlertError('Failed', message);
+            ui.showAlertError('Failed', message);
             return;
         }
 
@@ -3084,22 +2393,25 @@ async function removeTaskFromProject(projectId, taskId) {
 
         const activeStageId = getCurrentStageId(projectId);
         loadProjectTasksByStage(projectId, activeStageId, {skipLoader: true});
+        ui.showAlertSuccess('Success', 'Task deleted successfully');
     } catch (e) {
         console.error('Error', e);
-        showAlertError('Error', 'Error while deleting task. See console for details.');
+        ui.showAlertError('Error', 'Error while deleting task. See console for details.');
+    } finally {
+        loader.unload();
     }
 }
 
 async function projectTasksSubmit() {
     const pidEl = getEl('pt_detail_projectId');
     if (!pidEl || !pidEl.value) {
-        showAlertWarning('Warning', 'Project ID not found');
+        ui.showAlertWarning('Warning', 'Project ID not found');
         return;
     }
 
     const projectId = parseInt(pidEl.value, 10);
     if (isNaN(projectId)) {
-        showAlertWarning('Warning', 'Invalid project ID');
+        ui.showAlertWarning('Warning', 'Invalid project ID');
         return;
     }
 
@@ -3135,7 +2447,7 @@ async function projectTasksSubmit() {
 
         if (!success) {
             const message = extractApiMessage(json) || 'Server reported failure when submitting project';
-            showAlertError('Failed', message);
+            ui.showAlertError('Failed', message);
             return;
         }
 
@@ -3152,17 +2464,17 @@ async function projectTasksSubmit() {
             if (el) el.classList.remove('active');
         }
 
-        showAlertSuccess('Success', 'Project submitted successfully');
+        ui.showAlertSuccess('Success', 'Project submitted successfully');
     } catch (e) {
         console.error('Failed to submit project:', e);
-        showAlertError('Failed', e && e.message ? e.message : 'Failed to submit project. Please try again.');
+        ui.showAlertError('Failed', e && e.message ? e.message : 'Failed to submit project. Please try again.');
     }
 }
 
 function openTaskDetailFromProject(taskId) {
     const modalEl = document.getElementById('taskDetailModal');
     if (!modalEl) {
-        showAlertError('Error', 'Modal not found');
+        ui.showAlertError('Error', 'Modal not found');
         return;
     }
 
@@ -3289,7 +2601,7 @@ async function saveProjectBasicInfoModal() {
     const model = document.getElementById('newProjectModel').value.trim();
 
     if (!customer || !name || !product || !model || !cftId) {
-        showAlertWarning(
+        ui.showAlertWarning(
             'Warning',
             'Please fill all required fields (Customer, Project Name, CFT Team, Product, Model)'
         );
@@ -3299,7 +2611,7 @@ async function saveProjectBasicInfoModal() {
     const created = await createProject(customer, name, product, model, cftId);
 
     if (!created) {
-        showAlertError('Failed', 'Please try again.');
+        ui.showAlertError('Failed', 'Please try again.');
         return;
     }
 
@@ -3327,7 +2639,7 @@ async function saveProjectBasicInfoModal() {
 
     await loadProjectList();
 
-    showAlertSuccess('Success', 'Project created successfully!');
+    ui.showAlertSuccess('Success', 'Project created successfully!');
     closeCreateProjectModal();
     await showProjectTasksModal(projectId);
 }
@@ -3353,7 +2665,7 @@ async function submitProjectFromModal() {
     }
 
     if (!selectedPPAPItems || selectedPPAPItems.length === 0) {
-        showAlertWarning('Warning', 'Please select at least one task');
+        ui.showAlertWarning('Warning', 'Please select at least one task');
         return;
     }
 
@@ -3362,14 +2674,14 @@ async function submitProjectFromModal() {
     try {
         const resolvedId = await ensureProjectPersisted(currentProject);
         if (!resolvedId) {
-            showAlertError('Failed', 'Please try again');
+            ui.showAlertError('Failed', 'Please try again');
             return;
         }
 
         const customerIdForSave = mapCustomerToId(currentProject.customer);
         const saveOk = await saveTasksForProject(taskIds, customerIdForSave, currentProject.name, resolvedId, null);
         if (!saveOk) {
-            showAlertError('Failed', 'Failed to add tasks. Please try again.');
+            ui.showAlertError('Failed', 'Failed to add tasks. Please try again.');
             return;
         }
 
@@ -3383,7 +2695,7 @@ async function submitProjectFromModal() {
             projectList.push(currentProject);
         }
 
-        showAlertSuccess(
+        ui.showAlertSuccess(
             'Success',
             `Project "${currentProject.name}" saved successfully with ${selectedPPAPItems.length} tasks.`
         );
@@ -3392,7 +2704,7 @@ async function submitProjectFromModal() {
         await loadProjectList();
     } catch (e) {
         console.error('Failed to submit project:', e);
-        showAlertError('Failed', 'Failed to submit project. Please try again.');
+        ui.showAlertError('Failed', 'Failed to submit project. Please try again.');
     }
 }
 
@@ -3562,7 +2874,7 @@ function saveProjectBasicInfo() {
     const model = document.getElementById('newProjectModel').value.trim();
 
     if (!customer || !name || !product || !model || !cftId) {
-        showAlertWarning(
+        ui.showAlertWarning(
             'Warning',
             'Please fill all required fields (Customer, Project Name, CFT Team, Product, Model)'
         );
@@ -3597,11 +2909,11 @@ function cancelProjectCreation() {
 
 async function submitProject() {
     if (!currentProject) {
-        showAlertWarning('Warning', 'Please save basic project info first');
+        ui.showAlertWarning('Warning', 'Please save basic project info first');
         return;
     }
     if (selectedPPAPItems.length === 0) {
-        showAlertWarning('Warning', 'Please select at least one PPAP item or add a custom task');
+        ui.showAlertWarning('Warning', 'Please select at least one PPAP item or add a custom task');
         return;
     }
 
@@ -3624,7 +2936,7 @@ async function submitProject() {
             currentProject.id = created.id;
             resolvedId = created.id;
         } else {
-            showAlertError('Failed', 'Failed to create project on server. Please try again.');
+            ui.showAlertError('Failed', 'Failed to create project on server. Please try again.');
             return;
         }
     }
@@ -3632,7 +2944,7 @@ async function submitProject() {
     const customerIdForSave = mapCustomerToId(currentProject.customer);
     const saveOk = await saveTasksForProject(taskIds, customerIdForSave, currentProject.name, resolvedId, null);
     if (!saveOk) {
-        showAlertError('Failed', 'Saving tasks to project failed. Please try again.');
+        ui.showAlertError('Failed', 'Saving tasks to project failed. Please try again.');
         return;
     }
 
@@ -3643,7 +2955,7 @@ async function submitProject() {
         projectList.push(currentProject);
     }
 
-    showAlertSuccess(
+    ui.showAlertSuccess(
         'Success',
         `Project "${currentProject.name}" saved successfully, containing ${currentProject.taskCount} tasks`
     );
@@ -3701,11 +3013,11 @@ async function showStandardPPAP() {
 
     let tasks = [];
     try {
-        const res = await fetch('/ppap-system/api/tasks/templates');
-        if (!res.ok) throw new Error(`Status ${res.status}`);
-        const json = await res.json();
-        tasks = Array.isArray(json.data) ? json.data : Array.isArray(json) ? json : [];
-        tasks = tasks.map((item) => ({
+        tasks = await api.fetchTaskTemplates();
+        if (tasks === null) {
+            throw new Error('Failed to load templates');
+        }
+        tasks = (Array.isArray(tasks) ? tasks : []).map((item) => ({
             id: item.id,
             taskCode: item.taskCode || '',
             name: item.name || '',
@@ -3781,7 +3093,7 @@ async function showStandardPPAP() {
     }
 
     try {
-        openModalAbove(modal);
+        ui.openModalAbove(modal);
     } catch (e) {
         console.error('Bootstrap Modal show error:', e);
         if (modal) modal.classList.add('active');
@@ -3792,58 +3104,6 @@ function closeStandardPPAP() {
     var modalEl = document.getElementById('standardPPAPModal');
     var bsModal = bootstrap.Modal.getInstance(modalEl);
     if (bsModal) bsModal.hide();
-}
-
-function openModalAbove(modalRef) {
-    const modalEl = typeof modalRef === 'string' ? document.getElementById(modalRef) : modalRef;
-    if (!modalEl) return null;
-
-    const shown = Array.from(document.querySelectorAll('.modal.show'));
-    let topZ = 1040;
-    shown.forEach((m) => {
-        const z = parseInt(window.getComputedStyle(m).zIndex, 10);
-        if (!isNaN(z) && z > topZ) topZ = z;
-    });
-
-    const modalZ = topZ + 20;
-    modalEl.style.zIndex = modalZ;
-
-    const bsModal = new bootstrap.Modal(modalEl);
-
-    modalEl.addEventListener('hidden.bs.modal', function cleanupBackdrop() {
-        setTimeout(() => {
-            const backdrops = document.querySelectorAll('.modal-backdrop');
-            const openModals = document.querySelectorAll('.modal.show');
-
-            if (backdrops.length > openModals.length) {
-                for (let i = openModals.length; i < backdrops.length; i++) {
-                    if (backdrops[i] && backdrops[i].parentNode) {
-                        backdrops[i].parentNode.removeChild(backdrops[i]);
-                    }
-                }
-            }
-
-            if (openModals.length === 0) {
-                document.body.classList.remove('modal-open');
-                document.body.style.paddingRight = '';
-                document.body.style.overflow = '';
-            }
-        }, 100);
-
-        modalEl.removeEventListener('hidden.bs.modal', cleanupBackdrop);
-    });
-
-    bsModal.show();
-
-    setTimeout(() => {
-        const backdrops = document.querySelectorAll('.modal-backdrop');
-        if (backdrops.length) {
-            const last = backdrops[backdrops.length - 1];
-            last.style.zIndex = modalZ - 10;
-        }
-    }, 10);
-
-    return bsModal;
 }
 
 function selectAllPPAP() {
@@ -3912,7 +3172,7 @@ function confirmPPAPSelection() {
     const checked = Array.from(document.querySelectorAll('.ppap-checkbox:checked'));
 
     if (checked.length === 0) {
-        showAlertWarning('Warning', 'Please select at least one PPAP item');
+        ui.showAlertWarning('Warning', 'Please select at least one PPAP item');
         return;
     }
 
@@ -3990,7 +3250,7 @@ function confirmPPAPSelection() {
         addedCount > 0
             ? `Added ${addedCount} new PPAP items (total: ${mergedTasks.length} tasks)`
             : `No new items added (total: ${mergedTasks.length} tasks)`;
-    showAlertSuccess('Success', message);
+    ui.showAlertSuccess('Success', message);
 
     renderSelectedTasksInModal();
 
@@ -4024,7 +3284,7 @@ async function showCustomTask() {
     var modal = document.getElementById('customTaskModal');
     try {
         await loadCustomTaskSelects();
-        const bs = openModalAbove(modal);
+        const bs = ui.openModalAbove(modal);
         try {
             setTimeout(() => {
                 initDeadlinePicker();
@@ -4044,20 +3304,20 @@ async function showCustomTask() {
 
 async function loadCustomTaskSelects() {
     try {
-        const departments = SELECT_CACHE['/api/departments'] || (await fetchOptions('/api/departments'));
-        const processes = SELECT_CACHE['/api/processes'] || (await fetchOptions('/api/processes'));
-        const priorities = SELECT_CACHE['/api/tasks/priorities'] || (await fetchOptions('/api/tasks/priorities'));
-        let stages = SELECT_CACHE['/api/stages'] || (await fetchOptions('/api/stages'));
+        const departments = SELECT_CACHE['/api/departments'] || (await api.fetchOptions('/api/departments'));
+        const processes = SELECT_CACHE['/api/processes'] || (await api.fetchOptions('/api/processes'));
+        const priorities = SELECT_CACHE['/api/tasks/priorities'] || (await api.fetchOptions('/api/tasks/priorities'));
+        let stages = SELECT_CACHE['/api/stages'] || (await api.fetchOptions('/api/stages'));
 
         SELECT_CACHE['/api/departments'] = departments;
         SELECT_CACHE['/api/processes'] = processes;
         SELECT_CACHE['/api/tasks/priorities'] = priorities;
         SELECT_CACHE['/api/stages'] = stages;
 
-        renderOptions('custom-sl-department', departments);
-        renderOptions('custom-sl-process', processes);
-        renderOptions('custom-sl-priority', priorities);
-        renderOptions('custom-sl-xvt', stages);
+        ui.renderOptions('custom-sl-department', departments);
+        ui.renderOptions('custom-sl-process', processes);
+        ui.renderOptions('custom-sl-priority', priorities);
+        ui.renderOptions('custom-sl-xvt', stages);
     } catch (e) {}
 }
 
@@ -4071,7 +3331,7 @@ function showCopyTemplate() {
     var modal = document.getElementById('copyTemplateModal');
     loadCopyTemplateSelects();
     try {
-        openModalAbove(modal);
+        ui.openModalAbove(modal);
     } catch (e) {
         console.error(e);
         if (modal) {
@@ -4083,7 +3343,7 @@ function showCopyTemplate() {
 
 async function loadCopyTemplateSelects() {
     try {
-        const customers = await fetchOptions('/api/customers');
+        const customers = await api.fetchOptions('/api/customers');
 
         const sourceCustomerSelect = document.getElementById('source-customer');
         const targetCustomerSelect = document.getElementById('target-customer');
@@ -4091,12 +3351,12 @@ async function loadCopyTemplateSelects() {
         if (sourceCustomerSelect && targetCustomerSelect) {
             const customerOptions =
                 '<option value="">Please select</option>' +
-                customers.map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+                customers.map((c) => `<option value="${c.id}">${ui.escapeHtml(c.name)}</option>`).join('');
             sourceCustomerSelect.innerHTML = customerOptions;
             targetCustomerSelect.innerHTML = customerOptions;
         }
 
-        const projects = await fetchOptions('/api/projects');
+        const projects = await api.fetchOptions('/api/projects');
 
         const sourceProjectSelect = document.getElementById('source-project-number');
         const targetProjectSelect = document.getElementById('target-project-number');
@@ -4104,12 +3364,12 @@ async function loadCopyTemplateSelects() {
         if (sourceProjectSelect && targetProjectSelect) {
             const projectOptions =
                 '<option value="">Please select</option>' +
-                projects.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('');
+                projects.map((p) => `<option value="${p.id}">${ui.escapeHtml(p.name)}</option>`).join('');
             sourceProjectSelect.innerHTML = projectOptions;
             targetProjectSelect.innerHTML = projectOptions;
         }
 
-        const stages = await fetchOptions('/api/stages');
+        const stages = await api.fetchOptions('/api/stages');
 
         const sourceStageSelect = document.getElementById('source-xvt-stage');
         const targetStageSelect = document.getElementById('target-xvt-stage');
@@ -4117,12 +3377,12 @@ async function loadCopyTemplateSelects() {
         if (sourceStageSelect && targetStageSelect) {
             const stageOptions =
                 '<option value="">Please select</option>' +
-                stages.map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
+                stages.map((s) => `<option value="${s.id}">${ui.escapeHtml(s.name)}</option>`).join('');
             sourceStageSelect.innerHTML = stageOptions;
             targetStageSelect.innerHTML = stageOptions;
         }
 
-        const processes = await fetchOptions('/api/processes');
+        const processes = await api.fetchOptions('/api/processes');
 
         const sourceProcessSelect = document.getElementById('source-process');
         const targetProcessSelect = document.getElementById('target-process');
@@ -4130,13 +3390,13 @@ async function loadCopyTemplateSelects() {
         if (sourceProcessSelect && targetProcessSelect) {
             const processOptions =
                 '<option value="">Please select</option>' +
-                processes.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('');
+                processes.map((p) => `<option value="${p.id}">${ui.escapeHtml(p.name)}</option>`).join('');
             sourceProcessSelect.innerHTML = processOptions;
             targetProcessSelect.innerHTML = processOptions;
         }
     } catch (error) {
         console.error('Error loading copy template selects:', error);
-        showAlertError('Error', 'Failed to load data for copy template');
+        ui.showAlertError('Error', 'Failed to load data for copy template');
     }
 }
 
@@ -4163,7 +3423,7 @@ async function confirmCopyProject() {
         !targetStageId ||
         !targetProcessId
     ) {
-        showAlertWarning('Warning', 'Please fill in all required fields');
+        ui.showAlertWarning('Warning', 'Please fill in all required fields');
         return;
     }
 
@@ -4191,13 +3451,13 @@ async function confirmCopyProject() {
 
         const result = await response.json();
 
-        showAlertSuccess('Success', 'Project copied successfully');
+        ui.showAlertSuccess('Success', 'Project copied successfully');
         closeCopyTemplate();
 
         await loadProjectList();
     } catch (error) {
         console.error('Error copying project:', error);
-        showAlertError('Error', error && error.message ? error.message : 'Failed to copy project');
+        ui.showAlertError('Error', error && error.message ? error.message : 'Failed to copy project');
     }
 }
 
@@ -4208,7 +3468,7 @@ function showRACIMatrix(projectId) {
 function showRACIMatrixFromProject() {
     const projectIdEl = document.getElementById('pt_detail_projectId');
     if (!projectIdEl || !projectIdEl.value) {
-        showAlertError('Error', 'Project ID not found');
+        ui.showAlertError('Error', 'Project ID not found');
         return;
     }
     showRACIMatrixForProject(projectIdEl.value);
@@ -4260,27 +3520,19 @@ async function loadRACIMatrixData(projectId) {
 
     const departments = SELECT_CACHE['/api/departments'] || [];
     if (departments.length === 0) {
-        const deptRes = await fetch('/ppap-system/api/departments');
-        if (deptRes.ok) {
-            const deptJson = await deptRes.json();
-            SELECT_CACHE['/api/departments'] = deptJson.data || [];
-            departments.push(...SELECT_CACHE['/api/departments']);
-        }
+        const deptItems = await api.fetchOptions('/api/departments');
+        SELECT_CACHE['/api/departments'] = deptItems;
+        departments.push(...deptItems);
     }
 
-    const tasksRes = await fetch(`/ppap-system/api/project/${projectId}/tasks`);
-    if (!tasksRes.ok) {
-        throw new Error(`Failed to fetch tasks: ${tasksRes.status}`);
+    const tasks = await api.fetchProjectTasks(projectId);
+    if (tasks === null) {
+        throw new Error('Failed to fetch tasks');
     }
-    const tasksJson = await tasksRes.json();
-    const tasks = tasksJson.data || [];
-
-    const raciRes = await fetch(`/ppap-system/api/project/${projectId}/task-raci`);
-    if (!raciRes.ok) {
-        throw new Error(`Failed to fetch RACI data: ${raciRes.status}`);
+    const raciData = await api.fetchProjectTaskRaci(projectId);
+    if (raciData === null) {
+        throw new Error('Failed to fetch RACI data');
     }
-    const raciJson = await raciRes.json();
-    const raciData = raciJson.data || [];
 
     currentRACIData = {};
     raciData.forEach((raci) => {
@@ -4334,7 +3586,7 @@ async function loadRACIMatrixData(projectId) {
 
 async function showRACIMatrixForProject(projectId) {
     if (!projectId || projectId === 'null' || projectId === 'undefined') {
-        showAlertWarning('Warning', 'Invalid project ID');
+        ui.showAlertWarning('Warning', 'Invalid project ID');
         return;
     }
 
@@ -4379,7 +3631,7 @@ async function showRACIMatrixForProject(projectId) {
     } catch (e) {
         loader.unload();
         console.error('Error showing RACI Matrix:', e);
-        showAlertError('Error', 'Failed to load RACI Matrix: ' + (e.message || e));
+        ui.showAlertError('Error', 'Failed to load RACI Matrix: ' + (e.message || e));
     }
 }
 
@@ -4429,7 +3681,7 @@ function closeRACIMatrix() {
 
 function saveRACIMatrix() {
     if (!currentRACIProjectId) {
-        showAlertError('Error', 'Project ID not found');
+        ui.showAlertError('Error', 'Project ID not found');
         return;
     }
 
@@ -4478,19 +3730,19 @@ function saveRACIMatrix() {
                 return response.json();
             })
             .then(async (result) => {
-                showAlertSuccess('Success', 'RACI Matrix saved successfully');
+                ui.showAlertSuccess('Success', 'RACI Matrix saved successfully');
                 await loadRACIMatrixData(currentRACIProjectId);
                 loader.unload();
             })
             .catch((error) => {
                 loader.unload();
                 console.error('Error saving RACI Matrix:', error);
-                showAlertError('Error', 'Failed to save RACI Matrix: ' + (error.message || error));
+                ui.showAlertError('Error', 'Failed to save RACI Matrix: ' + (error.message || error));
             });
     } catch (e) {
         loader.unload();
         console.error('Error in saveRACIMatrix:', e);
-        showAlertError('Error', 'Failed to save RACI Matrix');
+        ui.showAlertError('Error', 'Failed to save RACI Matrix');
     }
 }
 
@@ -4513,11 +3765,11 @@ async function approveProject(projectId) {
 
         if (!res.ok) {
             const message = await getApiErrorMessage(res, `Approve API returned ${res.status}`);
-            showAlertError('Failed', message);
+            ui.showAlertError('Failed', message);
             return;
         }
 
-        showAlertSuccess('Approved', 'Project approved successfully');
+        ui.showAlertSuccess('Approved', 'Project approved successfully');
         const project = projectList.find((p) => String(p.id) === String(projectId));
         if (project) project.status = 'approved';
         await loadProjectList();
@@ -4530,7 +3782,7 @@ async function approveProject(projectId) {
         } catch (e) {}
     } catch (e) {
         console.error('Approve API error', e);
-        showAlertError('Failed', 'Failed to call approve API: ' + (e && e.message ? e.message : e));
+        ui.showAlertError('Failed', 'Failed to call approve API: ' + (e && e.message ? e.message : e));
     }
 }
 
@@ -4554,11 +3806,11 @@ async function rejectProject(projectId) {
 
         if (!res.ok) {
             const message = await getApiErrorMessage(res, `Return API returned ${res.status}`);
-            showAlertError('Failed', message);
+            ui.showAlertError('Failed', message);
             return;
         }
 
-        showAlertWarning('Rejected', 'Project has been returned/rejected');
+        ui.showAlertWarning('Rejected', 'Project has been returned/rejected');
         const project = projectList.find((p) => String(p.id) === String(projectId));
         if (project) project.status = 'rejected';
         await loadProjectList();
@@ -4571,7 +3823,7 @@ async function rejectProject(projectId) {
         } catch (e) {}
     } catch (e) {
         console.error('Return API error', e);
-        showAlertError('Failed', 'Failed to call return API: ' + (e && e.message ? e.message : e));
+        ui.showAlertError('Failed', 'Failed to call return API: ' + (e && e.message ? e.message : e));
     }
 }
 
@@ -4619,16 +3871,16 @@ async function deleteProject(projectId) {
 
         if (!ok) {
             const message = extractApiMessage(json) || 'Server reported failure when deleting project.';
-            showAlertError('Failed', message);
+            ui.showAlertError('Failed', message);
             return;
         }
 
         projectList = projectList.filter((p) => String(p.id) !== String(projectId));
-        showAlertSuccess('Success', `Project "${project.name}" has been deleted`);
+        ui.showAlertSuccess('Success', `Project "${project.name}" has been deleted`);
         await loadProjectList();
     } catch (e) {
         console.error('Failed to delete project:', e);
-        showAlertError('Failed', e && e.message ? e.message : 'Failed to delete project. Please try again.');
+        ui.showAlertError('Failed', e && e.message ? e.message : 'Failed to delete project. Please try again.');
     }
 }
 
@@ -4670,7 +3922,7 @@ function initDeadlinePicker() {
             } catch (e) {}
 
             const currentValue = el.value || '';
-            singlePicker($(el), currentValue, withTime);
+            ui.singlePicker($(el), currentValue, withTime);
 
             $(el).on('apply.daterangepicker', function (ev, picker) {
                 try {
@@ -4695,31 +3947,8 @@ function initDeadlinePicker() {
     });
 }
 
-function getProjectIdFromLocation() {
-    try {
-        const params = new URLSearchParams(window.location.search || '');
-        const qProjectId = params.get('projectId');
-        if (qProjectId) return qProjectId;
-        return null;
-    } catch (e) {
-        return null;
-    }
-}
-
-function getTaskIdFromLocation() {
-    try {
-        const params = new URLSearchParams(window.location.search || '');
-        const qTaskId = params.get('taskId');
-        if (qTaskId) return qTaskId;
-
-        return null;
-    } catch (e) {
-        return null;
-    }
-}
-
 async function urlProject() {
-    const projectId = getProjectIdFromLocation();
+    const projectId = getQueryParam('projectId');
     if (!projectId) return;
 
     try {
@@ -4743,7 +3972,7 @@ async function urlProject() {
 }
 
 async function urlTask() {
-    const taskId = getTaskIdFromLocation();
+    const taskId = getQueryParam('taskId');
     if (!taskId) return;
 
     try {
@@ -4755,15 +3984,7 @@ async function urlTask() {
             retries++;
         }
 
-        const res = await fetch(`/ppap-system/api/tasks/${encodeURIComponent(taskId)}`);
-        if (!res.ok) {
-            await showTaskDetailModal(null, taskId);
-            return;
-        }
-
-        const json = await res.json();
-        const task = json.data || json.result || null;
-
+        const task = await api.fetchTaskById(taskId);
         if (!task) {
             await showTaskDetailModal(null, taskId);
             return;
@@ -4780,19 +4001,6 @@ async function urlTask() {
             console.error('Fallback showTaskDetailModal failed', err);
         }
     }
-}
-
-function debounce(fn, wait) {
-    let timeout = null;
-    return function () {
-        const args = arguments;
-        const later = () => {
-            timeout = null;
-            fn.apply(this, args);
-        };
-        clearTimeout(timeout);
-        timeout = setTimeout(later, wait);
-    };
 }
 
 function filterProjectTasksByName(query) {
@@ -4875,32 +4083,8 @@ function handleActionClick(ev) {
     handler(target, ev);
 }
 
-document.addEventListener('click', handleActionClick);
-
-TaskDetailModal.init({
-    helpers: {
-        getStatusLabel,
-        getStatusBadgeClass,
-        getPriorityLabel,
-        getPriorityBadgeClass,
-        normalizeStatus,
-        getStageName,
-        getUserLabelById,
-        formatCommentContent,
-        fetchStagesForProject,
-        fetchOptions,
-        renderOptions,
-        findProjectById,
-        getCurrentStageId,
-        loadProjectTasksByStage,
-    },
-    selectCache: SELECT_CACHE,
-});
-
-document.addEventListener('DOMContentLoaded', async () => {
+async function initializeManagementPage() {
     const SELECTORS = {
-        upload: '#upload',
-        comment: '#comment',
         addCustom: '#add-custom',
         searchTask: '#search-task',
         filterDate: '#filter-created-date',
@@ -4967,7 +4151,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             $input.off('apply.daterangepicker cancel.daterangepicker');
         }
 
-        rangePicker($input, null, null);
+        ui.rangePicker($input, null, null);
 
         $input.on('apply.daterangepicker', (ev, picker) => {
             const start = picker.startDate.format('YYYY/MM/DD');
@@ -5018,7 +4202,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const input = modal.querySelector(SELECTORS.newStageName);
             if (input) input.value = '';
             
-            openModalAbove(modal);
+            ui.openModalAbove(modal);
         });
 
         bindEvent(SELECTORS.confirmCreateStage, 'click', handleCreateStageConfirm);
@@ -5038,18 +4222,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     const setupModalCleanup = () => {
-        const cleanupUrl = (paramName) => {
-            const url = new URL(window.location.href);
-            url.searchParams.delete(paramName);
-            window.history.pushState({}, '', url.toString());
-        };
-
         bindEvent(SELECTORS.taskDetailModal, 'hidden.bs.modal', () => {
-            cleanupUrl('taskId');
+            clearQueryParam('taskId', {state: {}});
+            const projectModal = document.querySelector(SELECTORS.projectTasksModal);
+            const isProjectOpen =
+                projectModal &&
+                (projectModal.classList.contains('show') || projectModal.classList.contains('active'));
+            if (!isProjectOpen) {
+                clearQueryParam('projectId', {state: {}});
+            }
         });
 
         bindEvent(SELECTORS.projectTasksModal, 'hidden.bs.modal', () => {
-            cleanupUrl('projectId');
+            clearQueryParam('projectId', {state: {}});
         });
     };
 
@@ -5065,7 +4250,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     const handleUrlParams = async () => {
-        const taskId = getTaskIdFromLocation();
+        const taskId = getQueryParam('taskId');
         
         if (taskId) {
             await urlTask();
@@ -5085,8 +4270,50 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     await safeAsync(loadAllSelects);
     await safeAsync(loadUsersAndInitDriSelects);
-    await safeAsync(initCommentMentionAutocomplete);
+    await safeAsync(initTaskDetailModalBindings);
     await safeAsync(loadProjectList);
     await safeAsync(initDeadlinePicker);
     await safeAsync(handleUrlParams);
-});
+}
+
+export function initManagementApp() {
+    document.addEventListener('click', handleActionClick);
+
+    document.addEventListener('hidden.bs.modal', function () {
+        setTimeout(() => {
+            ui.cleanUpModal();
+        }, 10);
+    });
+
+    TaskDetailModal.init({
+        helpers: {
+            getStatusLabel,
+            getStatusBadgeClass,
+            getPriorityLabel,
+            getPriorityBadgeClass,
+            normalizeStatus,
+            getStageName,
+            getUserLabelById,
+            fetchStagesForProject: api.fetchStagesForProject,
+            fetchOptions: api.fetchOptions,
+            renderOptions: ui.renderOptions,
+            findProjectById,
+            getCurrentStageId,
+            loadProjectTasksByStage,
+        },
+        selectCache: SELECT_CACHE,
+    });
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initializeManagementPage);
+    } else {
+        initializeManagementPage();
+    }
+}
+
+if (typeof window !== 'undefined') {
+    if (!window.__ppapManagementInit) {
+        window.__ppapManagementInit = true;
+        initManagementApp();
+    }
+}
